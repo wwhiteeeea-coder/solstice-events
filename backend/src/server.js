@@ -4,7 +4,7 @@ import 'express-async-errors';
 import { Server } from 'socket.io';
 import http from 'http';
 import dotenv from 'dotenv';
-import { PrismaClient } from '@prisma/client';
+import { createClient } from '@supabase/supabase-js';
 import { v4 as uuidv4 } from 'uuid';
 import amqp from 'amqplib';
 import { logger } from './utils/logger.js';
@@ -21,7 +21,12 @@ const io = new Server(server, {
   }
 });
 
-const prisma = new PrismaClient();
+// Initialize Supabase
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_SERVICE_ROLE_KEY
+);
+
 let channel = null;
 let rabbitmqConnection = null;
 
@@ -74,17 +79,20 @@ async function connectRabbitMQ() {
 // Health Check
 app.get('/api/health', async (req, res) => {
   try {
-    // Test database
-    await prisma.$queryRaw`SELECT 1`;
+    // Test Supabase connection
+    const { error: dbError } = await supabase
+      .from('attendees')
+      .select('count')
+      .limit(1);
     
     const services = {
-      database: 'connected',
+      database: dbError ? 'disconnected' : 'connected',
       rabbitmq: channel ? 'connected' : 'disconnected',
       api: 'online'
     };
 
     res.json({
-      status: 'ok',
+      status: dbError ? 'error' : 'ok',
       timestamp: new Date().toISOString(),
       services
     });
@@ -112,35 +120,37 @@ app.post('/api/check-in', async (req, res) => {
     const { qrCode } = value;
 
     // Find attendee
-    const attendee = await prisma.attendee.findUnique({
-      where: { qrCode }
-    });
+    const { data: attendee, error: findError } = await supabase
+      .from('attendees')
+      .select()
+      .eq('qr_code', qrCode)
+      .single();
 
-    if (!attendee) {
+    if (findError || !attendee) {
       logger.warn(`Invalid QR code scanned: ${qrCode}`);
       return res.status(404).json({ error: 'Attendee not found' });
     }
 
     // Log activity
-    await prisma.activityLog.create({
-      data: {
-        attendeeId: attendee.id,
+    await supabase
+      .from('activity_logs')
+      .insert({
+        attendee_id: attendee.id,
         action: 'QR_SCANNED',
         description: `QR code ${qrCode} scanned`,
         metadata: { qrCode }
-      }
-    });
+      });
 
     // Check current status
     if (attendee.status === 'CHECKED_IN') {
       logger.warn(`Duplicate scan blocked (already checked in): ${attendee.id}`);
-      await prisma.activityLog.create({
-        data: {
-          attendeeId: attendee.id,
+      await supabase
+        .from('activity_logs')
+        .insert({
+          attendee_id: attendee.id,
           action: 'DUPLICATE_SCAN_BLOCKED',
           description: 'Duplicate scan - attendee already checked in'
-        }
-      });
+        });
       
       io.emit('checkin:duplicate', {
         attendeeId: attendee.id,
@@ -154,13 +164,13 @@ app.post('/api/check-in', async (req, res) => {
 
     if (attendee.status === 'PENDING_PRINT') {
       logger.warn(`Duplicate scan blocked (pending): ${attendee.id}`);
-      await prisma.activityLog.create({
-        data: {
-          attendeeId: attendee.id,
+      await supabase
+        .from('activity_logs')
+        .insert({
+          attendee_id: attendee.id,
           action: 'DUPLICATE_SCAN_BLOCKED',
           description: 'Duplicate scan - badge print in progress'
-        }
-      });
+        });
       
       io.emit('checkin:duplicate', {
         attendeeId: attendee.id,
@@ -172,55 +182,53 @@ app.post('/api/check-in', async (req, res) => {
       });
     }
 
-    // Use transaction to create print job and update attendee atomically
-    const result = await prisma.$transaction(async (tx) => {
-      // Re-check status inside transaction (FOR UPDATE lock)
-      const attendeeInTx = await tx.attendee.findUnique({
-        where: { id: attendee.id }
-      });
+    // Create print job
+    const printJobId = `JOB-${uuidv4()}`;
+    
+    const { data: printJob, error: jobError } = await supabase
+      .from('print_jobs')
+      .insert({
+        id: printJobId,
+        attendee_id: attendee.id,
+        status: 'CREATED',
+        queued_at: new Date().toISOString()
+      })
+      .select()
+      .single();
 
-      if (attendeeInTx.status !== 'NOT_CHECKED_IN' && attendeeInTx.status !== 'FAILED') {
-        throw new Error('STATUS_CHANGED');
-      }
+    if (jobError) {
+      logger.error('Failed to create print job:', jobError);
+      return res.status(500).json({ error: 'Failed to create print job' });
+    }
 
-      // Create print job
-      const printJob = await tx.printJob.create({
-        data: {
-          id: `JOB-${uuidv4()}`,
-          attendeeId: attendee.id,
-          status: 'CREATED',
-          queuedAt: new Date()
-        }
-      });
+    // Update attendee status
+    const { error: updateError } = await supabase
+      .from('attendees')
+      .update({ status: 'PENDING_PRINT', updated_at: new Date().toISOString() })
+      .eq('id', attendee.id);
 
-      // Update attendee status
-      const updatedAttendee = await tx.attendee.update({
-        where: { id: attendee.id },
-        data: { status: 'PENDING_PRINT' }
-      });
-
-      return { printJob, attendee: updatedAttendee };
-    });
-
-    const { printJob, attendee: updatedAttendee } = result;
+    if (updateError) {
+      logger.error('Failed to update attendee status:', updateError);
+      return res.status(500).json({ error: 'Failed to update attendee' });
+    }
 
     // Log activity
-    await prisma.activityLog.create({
-      data: {
-        attendeeId: attendee.id,
-        printJobId: printJob.id,
+    await supabase
+      .from('activity_logs')
+      .insert({
+        attendee_id: attendee.id,
+        print_job_id: printJobId,
         action: 'PRINT_JOB_CREATED',
-        description: `Print job created: ${printJob.id}`
-      }
-    });
+        description: `Print job created: ${printJobId}`
+      });
 
     // Publish to RabbitMQ
     const message = {
-      printJobId: printJob.id,
+      printJobId,
       attendeeId: attendee.id,
       attendeeName: attendee.name,
-      qrCode: attendee.qrCode,
-      attemptNumber: printJob.attemptCount,
+      qrCode: attendee.qr_code,
+      attemptNumber: 1,
       timestamp: new Date().toISOString()
     };
 
@@ -233,48 +241,44 @@ app.post('/api/check-in', async (req, res) => {
       );
 
       // Update job status
-      await prisma.printJob.update({
-        where: { id: printJob.id },
-        data: { status: 'QUEUED' }
-      });
+      await supabase
+        .from('print_jobs')
+        .update({ status: 'QUEUED' })
+        .eq('id', printJobId);
 
-      await prisma.activityLog.create({
-        data: {
-          attendeeId: attendee.id,
-          printJobId: printJob.id,
+      await supabase
+        .from('activity_logs')
+        .insert({
+          attendee_id: attendee.id,
+          print_job_id: printJobId,
           action: 'PRINT_JOB_QUEUED',
-          description: `Print job queued to RabbitMQ`
-        }
-      });
+          description: 'Print job queued to RabbitMQ'
+        });
     }
 
     // Emit Socket.IO event
     io.emit('checkin:submitted', {
       attendeeId: attendee.id,
       attendeeName: attendee.name,
-      printJobId: printJob.id
+      printJobId
     });
 
-    logger.info(`Check-in accepted: ${attendee.name} (${printJob.id})`);
+    logger.info(`Check-in accepted: ${attendee.name} (${printJobId})`);
 
     res.status(202).json({
       success: true,
       message: 'Print job created successfully',
       attendee: {
-        id: updatedAttendee.id,
-        name: updatedAttendee.name,
-        status: updatedAttendee.status
+        id: attendee.id,
+        name: attendee.name,
+        status: 'PENDING_PRINT'
       },
       printJob: {
-        id: printJob.id,
-        status: printJob.status
+        id: printJobId,
+        status: 'QUEUED'
       }
     });
   } catch (error) {
-    if (error.message === 'STATUS_CHANGED') {
-      logger.warn('Race condition detected - status changed during transaction');
-      return res.status(409).json({ error: 'Race condition detected' });
-    }
     logger.error('Check-in error:', error);
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -286,41 +290,36 @@ app.get('/api/attendees', async (req, res) => {
     const { page = 1, limit = 20, status, search } = req.query;
     const skip = (parseInt(page) - 1) * parseInt(limit);
 
-    const where = {};
+    let query = supabase.from('attendees').select();
+    
     if (status && status !== 'ALL') {
-      where.status = status;
+      query = query.eq('status', status);
     }
+    
     if (search) {
-      where.OR = [
-        { name: { contains: search, mode: 'insensitive' } },
-        { email: { contains: search, mode: 'insensitive' } }
-      ];
+      query = query.or(`name.ilike.%${search}%,email.ilike.%${search}%`);
     }
 
-    const [data, total] = await Promise.all([
-      prisma.attendee.findMany({
-        where,
-        skip,
-        take: parseInt(limit),
-        select: {
-          id: true,
-          name: true,
-          email: true,
-          qrCode: true,
-          status: true,
-          createdAt: true
-        }
-      }),
-      prisma.attendee.count({ where })
-    ]);
+    const { data, error, count } = await query
+      .range(skip, skip + parseInt(limit) - 1)
+      .select('id, name, email, qr_code, status, created_at', { count: 'exact' });
+
+    if (error) {
+      logger.error('Get attendees error:', error);
+      return res.status(500).json({ error: 'Failed to fetch attendees' });
+    }
 
     res.json({
-      data,
+      data: data.map(a => ({
+        ...a,
+        qrCode: a.qr_code,
+        createdAt: a.created_at
+      })),
       pagination: {
         page: parseInt(page),
         limit: parseInt(limit),
-        total,
-        pages: Math.ceil(total / parseInt(limit))
+        total: count || 0,
+        pages: Math.ceil((count || 0) / parseInt(limit))
       }
     });
   } catch (error) {
@@ -332,25 +331,37 @@ app.get('/api/attendees', async (req, res) => {
 // Get Attendee by ID
 app.get('/api/attendees/:id', async (req, res) => {
   try {
-    const attendee = await prisma.attendee.findUnique({
-      where: { id: req.params.id },
-      include: {
-        printJobs: {
-          orderBy: { createdAt: 'desc' },
-          take: 10
-        },
-        activityLogs: {
-          orderBy: { createdAt: 'desc' },
-          take: 20
-        }
-      }
-    });
+    const { data: attendee, error } = await supabase
+      .from('attendees')
+      .select()
+      .eq('id', req.params.id)
+      .single();
 
-    if (!attendee) {
+    if (error || !attendee) {
       return res.status(404).json({ error: 'Attendee not found' });
     }
 
-    res.json(attendee);
+    // Get print jobs
+    const { data: printJobs } = await supabase
+      .from('print_jobs')
+      .select()
+      .eq('attendee_id', req.params.id)
+      .order('created_at', { ascending: false })
+      .limit(10);
+
+    // Get activity logs
+    const { data: activityLogs } = await supabase
+      .from('activity_logs')
+      .select()
+      .eq('attendee_id', req.params.id)
+      .order('created_at', { ascending: false })
+      .limit(20);
+
+    res.json({
+      ...attendee,
+      printJobs: printJobs || [],
+      activityLogs: activityLogs || []
+    });
   } catch (error) {
     logger.error('Get attendee error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -360,19 +371,31 @@ app.get('/api/attendees/:id', async (req, res) => {
 // Dashboard Stats
 app.get('/api/dashboard/stats', async (req, res) => {
   try {
-    const [totalRegistered, checkedIn, pendingPrint, failed] = await Promise.all([
-      prisma.attendee.count(),
-      prisma.attendee.count({ where: { status: 'CHECKED_IN' } }),
-      prisma.attendee.count({ where: { status: 'PENDING_PRINT' } }),
-      prisma.attendee.count({ where: { status: 'FAILED' } })
-    ]);
+    const { count: totalRegistered } = await supabase
+      .from('attendees')
+      .select('id', { count: 'exact' });
+
+    const { count: checkedIn } = await supabase
+      .from('attendees')
+      .select('id', { count: 'exact' })
+      .eq('status', 'CHECKED_IN');
+
+    const { count: pendingPrint } = await supabase
+      .from('attendees')
+      .select('id', { count: 'exact' })
+      .eq('status', 'PENDING_PRINT');
+
+    const { count: failed } = await supabase
+      .from('attendees')
+      .select('id', { count: 'exact' })
+      .eq('status', 'FAILED');
 
     res.json({
-      totalRegistered,
-      checkedIn,
-      pendingPrint,
-      failed,
-      remaining: totalRegistered - checkedIn - pendingPrint - failed
+      totalRegistered: totalRegistered || 0,
+      checkedIn: checkedIn || 0,
+      pendingPrint: pendingPrint || 0,
+      failed: failed || 0,
+      remaining: (totalRegistered || 0) - (checkedIn || 0) - (pendingPrint || 0) - (failed || 0)
     });
   } catch (error) {
     logger.error('Dashboard stats error:', error);
@@ -394,12 +417,13 @@ app.post('/api/webhooks/print-complete', async (req, res) => {
     logger.info(`Webhook received for job ${printJobId}: ${status}`);
 
     // Find print job
-    const printJob = await prisma.printJob.findUnique({
-      where: { id: printJobId },
-      include: { attendee: true }
-    });
+    const { data: printJob, error: jobError } = await supabase
+      .from('print_jobs')
+      .select()
+      .eq('id', printJobId)
+      .single();
 
-    if (!printJob) {
+    if (jobError || !printJob) {
       logger.warn(`Webhook received for unknown job: ${printJobId}`);
       return res.status(200).json({ received: true, processed: false });
     }
@@ -407,71 +431,88 @@ app.post('/api/webhooks/print-complete', async (req, res) => {
     // Check if already processed (idempotency)
     if (printJob.status === 'SUCCESS' || printJob.status === 'FAILED') {
       logger.info(`Webhook duplicate for job ${printJobId} - already processed`);
-      await prisma.activityLog.create({
-        data: {
-          printJobId: printJob.id,
-          attendeeId: printJob.attendeeId,
+      await supabase
+        .from('activity_logs')
+        .insert({
+          print_job_id: printJob.id,
+          attendee_id: printJob.attendee_id,
           action: 'WEBHOOK_DUPLICATE',
           description: `Duplicate webhook received for job ${printJobId}`
-        }
-      });
+        });
       return res.status(200).json({ received: true, alreadyProcessed: true });
     }
 
     // Update print job
-    const updatedJob = await prisma.printJob.update({
-      where: { id: printJobId },
-      data: {
+    const { error: updateJobError } = await supabase
+      .from('print_jobs')
+      .update({
         status: status === 'SUCCESS' ? 'SUCCESS' : 'FAILED',
-        completedAt: new Date(completedAt),
-        errorMessage: printError || null
-      }
-    });
+        completed_at: completedAt,
+        error_message: printError || null
+      })
+      .eq('id', printJobId);
+
+    if (updateJobError) {
+      logger.error('Failed to update print job:', updateJobError);
+      return res.status(500).json({ error: 'Failed to update print job' });
+    }
 
     // Update attendee status
-    const updatedAttendee = await prisma.attendee.update({
-      where: { id: printJob.attendeeId },
-      data: {
-        status: status === 'SUCCESS' ? 'CHECKED_IN' : 'FAILED'
-      }
-    });
+    const { error: updateAttendeeError } = await supabase
+      .from('attendees')
+      .update({
+        status: status === 'SUCCESS' ? 'CHECKED_IN' : 'FAILED',
+        updated_at: new Date().toISOString()
+      })
+      .eq('id', printJob.attendee_id);
+
+    if (updateAttendeeError) {
+      logger.error('Failed to update attendee:', updateAttendeeError);
+    }
+
+    // Get attendee for response
+    const { data: attendee } = await supabase
+      .from('attendees')
+      .select()
+      .eq('id', printJob.attendee_id)
+      .single();
 
     // Log activity
-    await prisma.activityLog.create({
-      data: {
-        attendeeId: printJob.attendeeId,
-        printJobId: printJobId,
+    await supabase
+      .from('activity_logs')
+      .insert({
+        attendee_id: printJob.attendee_id,
+        print_job_id: printJob.id,
         action: status === 'SUCCESS' ? 'PRINT_SUCCESS' : 'PRINT_FAILED',
         description: status === 'SUCCESS' 
           ? 'Badge successfully printed and confirmed'
           : `Badge printing failed: ${printError}`,
         metadata: { webhookStatus: status }
-      }
-    });
+      });
 
     // Emit Socket.IO event
     if (status === 'SUCCESS') {
       io.emit('checkin:success', {
-        attendeeId: printJob.attendeeId,
-        attendeeName: printJob.attendee.name,
-        printJobId: printJobId,
+        attendeeId: printJob.attendee_id,
+        attendeeName: attendee?.name,
+        printJobId,
         completedAt
       });
-      logger.info(`Check-in completed: ${printJob.attendee.name}`);
+      logger.info(`Check-in completed: ${attendee?.name}`);
     } else {
       io.emit('checkin:failed', {
-        attendeeId: printJob.attendeeId,
-        printJobId: printJobId,
+        attendeeId: printJob.attendee_id,
+        printJobId,
         error: printError
       });
-      logger.warn(`Check-in failed: ${printJob.attendee.name} - ${printError}`);
+      logger.warn(`Check-in failed: ${attendee?.name} - ${printError}`);
     }
 
     res.status(200).json({
       received: true,
       processed: true,
       jobId: printJobId,
-      status: updatedJob.status
+      status: status === 'SUCCESS' ? 'SUCCESS' : 'FAILED'
     });
   } catch (error) {
     logger.error('Webhook processing error:', error);
@@ -504,9 +545,17 @@ const PORT = process.env.BACKEND_PORT || 3000;
 
 async function startServer() {
   try {
-    // Connect to database
-    await prisma.$connect();
-    logger.info('✓ Connected to PostgreSQL');
+    // Test Supabase connection
+    const { error: dbError } = await supabase
+      .from('attendees')
+      .select('count')
+      .limit(1);
+    
+    if (dbError) {
+      logger.warn('⚠ Supabase connection issue:', dbError);
+    } else {
+      logger.info('✓ Connected to Supabase');
+    }
 
     // Connect to RabbitMQ
     const rabbitmqConnected = await connectRabbitMQ();
@@ -531,7 +580,6 @@ startServer();
 // Graceful shutdown
 process.on('SIGINT', async () => {
   logger.info('Shutting down gracefully...');
-  await prisma.$disconnect();
   if (channel) await channel.close();
   if (rabbitmqConnection) await rabbitmqConnection.close();
   server.close(() => {
