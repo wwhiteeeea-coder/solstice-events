@@ -1,0 +1,87 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model Attendee {
+  id        String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  name      String   @db.VarChar(255)
+  email     String   @unique @db.VarChar(255)
+  phone     String?  @db.VarChar(20)
+  qrCode    String   @unique @db.VarChar(100) @map("qr_code")
+  status    AttendeeStatus @default(NOT_CHECKED_IN) @map("status")
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  printJobs   PrintJob[]
+  activityLogs ActivityLog[]
+
+  @@index([qrCode])
+  @@index([status])
+  @@index([email])
+  @@map("attendees")
+}
+
+model PrintJob {
+  id           String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  attendeeId   String   @db.Uuid @map("attendee_id")
+  status       PrintJobStatus @default(CREATED) @map("status")
+  vendorJobId  String?  @db.VarChar(255) @map("vendor_job_id")
+  attemptCount Int      @default(1) @map("attempt_count")
+  errorMessage String?  @map("error_message")
+  queuedAt     DateTime? @map("queued_at")
+  processingAt DateTime? @map("processing_at")
+  completedAt  DateTime? @map("completed_at")
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  attendee Attendee @relation(fields: [attendeeId], references: [id], onDelete: Cascade)
+  activityLogs ActivityLog[]
+
+  @@index([attendeeId])
+  @@index([status])
+  @@index([vendorJobId])
+  @@map("print_jobs")
+}
+
+model ActivityLog {
+  id          String   @id @default(dbgenerated("gen_random_uuid()")) @db.Uuid
+  attendeeId  String?  @db.Uuid @map("attendee_id")
+  printJobId  String?  @db.Uuid @map("print_job_id")
+  action      String   @db.VarChar(100)
+  description String?
+  metadata    Json?    @default("{}")
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  attendee  Attendee?  @relation(fields: [attendeeId], references: [id], onDelete: SetNull)
+  printJob  PrintJob?  @relation(fields: [printJobId], references: [id], onDelete: SetNull)
+
+  @@index([attendeeId])
+  @@index([printJobId])
+  @@index([action])
+  @@index([createdAt])
+  @@map("activity_logs")
+}
+
+enum AttendeeStatus {
+  NOT_CHECKED_IN
+  PENDING_PRINT
+  CHECKED_IN
+  FAILED
+}
+
+enum PrintJobStatus {
+  CREATED
+  QUEUED
+  PROCESSING
+  SUCCESS
+  FAILED
+  RETRYING
+}
